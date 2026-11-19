@@ -1,6 +1,5 @@
 package com.cleansense.app.sensor
 
-import kotlin.math.abs
 import kotlin.math.roundToInt
 
 enum class AirStatus {
@@ -21,31 +20,20 @@ data class AirReading(
     val calibrationProgress: Float = 0f,
 )
 
-/**
- * Convierte las lecturas analógicas del MQ-135 (0 a 1023) en un estado de aire.
- *
- * El MQ-135 entrega un valor más alto cuando hay más gases/olores (COV, alcohol,
- * amoníaco, humo, etc.). Como cada sensor es distinto, la app primero toma
- * [calibrationSamples] lecturas para conocer el valor del aire limpio (línea base)
- * y luego compara cada lectura contra esa base:
- *
- *  - subida ≥ [vocDelta]                 → VOC (olores detectados)
- *  - estaba en VOC y baja de [recoverDelta] → RECOVERING (volviendo a niveles base)
- *  - en RECOVERING y baja de [normalDelta]  → NORMAL
- *
- * Ajusta los umbrales según tu sensor (ver README).
- */
 class AirQualityAnalyzer(
     private val calibrationSamples: Int = 10,
-    private val vocDelta: Double = 60.0,
-    private val recoverDelta: Double = 45.0,
-    private val normalDelta: Double = 20.0,
-    private val smoothing: Double = 0.35,
-    private val baselineDrift: Double = 0.02,
+    private val vocDelta: Double = 15.0,      // ← Con +15 o más pasa a VOC ("Mandar a lavar")
+    private val recoverDelta: Double = 10.0,  // ← Al bajar de +10 pasa a RECOVERING ("Volviendo a niveles base")
+    private val normalDelta: Double = 5.0,    // ← Al bajar de +5 vuelve a NORMAL ("Aire normal")
+    private val smoothing: Double = 0.45,
+    private val baselineWindowMs: Long = 30_000L,
 ) {
     private val calibration = mutableListOf<Int>()
     private var baseline: Double? = null
     private var smoothed: Double? = null
+
+    private var windowStartTime: Long = 0L
+    private var windowMin: Double? = null
 
     var current: AirReading = AirReading(AirStatus.CALIBRATING)
         private set
@@ -54,11 +42,14 @@ class AirQualityAnalyzer(
         calibration.clear()
         baseline = null
         smoothed = null
+        windowStartTime = 0L
+        windowMin = null
         current = AirReading(AirStatus.CALIBRATING)
     }
 
     fun process(raw: Int): AirReading {
-        // Media móvil exponencial: evita que el estado "parpadee" por ruido.
+        if (raw <= 0) return current
+
         val value = smoothed?.let { it + smoothing * (raw - it) } ?: raw.toDouble()
         smoothed = value
 
@@ -66,9 +57,11 @@ class AirQualityAnalyzer(
         if (base == null) {
             calibration += raw
             current = if (calibration.size >= calibrationSamples) {
-                val avg = calibration.average()
-                baseline = avg
-                AirReading(AirStatus.NORMAL, raw, avg.roundToInt(), 1f)
+                val initialMin = calibration.min().toDouble()
+                baseline = initialMin
+                windowStartTime = System.currentTimeMillis()
+                windowMin = initialMin
+                AirReading(AirStatus.NORMAL, raw, initialMin.roundToInt(), 1f)
             } else {
                 AirReading(
                     status = AirStatus.CALIBRATING,
@@ -79,7 +72,24 @@ class AirQualityAnalyzer(
             return current
         }
 
-        val delta = value - base
+        val currentWindowMin = windowMin
+        if (currentWindowMin == null || value < currentWindowMin) {
+            windowMin = value
+        }
+
+        val now = System.currentTimeMillis()
+        var currentBase: Double = base
+        if (now - windowStartTime >= baselineWindowMs) {
+            val minInWindow = windowMin
+            if (minInWindow != null && minInWindow < currentBase) {
+                currentBase = minInWindow
+                baseline = currentBase
+            }
+            windowStartTime = now
+            windowMin = value
+        }
+
+        val delta = value - currentBase
         val status = when (current.status) {
             AirStatus.VOC ->
                 if (delta < recoverDelta) AirStatus.RECOVERING else AirStatus.VOC
@@ -92,22 +102,13 @@ class AirQualityAnalyzer(
                 if (delta >= vocDelta) AirStatus.VOC else AirStatus.NORMAL
         }
 
-        // Con aire normal la línea base sigue lentamente la deriva del sensor
-        // (temperatura, humedad, calentamiento).
-        var newBase = base
-        if (status == AirStatus.NORMAL && (delta < 0 || abs(delta) < normalDelta)) {
-            newBase = base + baselineDrift * (value - base)
-            baseline = newBase
-        }
-
-        current = AirReading(status, raw, newBase.roundToInt(), 1f)
+        current = AirReading(status, raw, currentBase.roundToInt(), 1f)
         return current
     }
 
     companion object {
         private val NUMBER = Regex("-?\\d+(\\.\\d+)?")
 
-        /** Extrae el primer número de una línea, p. ej. "312", "MQ135:312" o "312.4". */
         fun parse(line: String): Int? =
             NUMBER.find(line)?.value?.toDoubleOrNull()?.roundToInt()
     }
